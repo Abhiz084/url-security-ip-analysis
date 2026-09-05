@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+
+# Environment (secrets)
+.env
+.env.local
+
+# Logs
+logs/
+*.log
+
+# Trained models (large files)
+models/model_versions/
+
+# Data (raw/processed)
+data/raw/
+data/processed/
+data/external/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
