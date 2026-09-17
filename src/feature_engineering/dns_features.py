@@ -1,138 +1,95 @@
 """
-DNS Feature Extractor
-Extracts features from DNS records
+DNS Feature Extractor — Enhanced via DNSIntelligence
+
+Returns features ready for ML:
+- Counts, flags, provider info
+- Uses cached DNS intelligence to avoid redundant lookups
 """
 
-import dns.resolver
-import time
-from datetime import datetime
 from loguru import logger
-from database.crud_operations import CRUDOperations
+
 
 class DNSFeatureExtractor:
-    """Extract DNS-related features"""
-    
+    """Extract DNS-based features for ML"""
+
     def __init__(self):
-        self.crud = CRUDOperations()
-        self.resolver = dns.resolver.Resolver()
-        self.resolver.timeout = 5
-        self.resolver.lifetime = 5
-    
-    def extract_dns_record_count(self, domain, record_type='A'):
-        """Feature 1: Number of DNS records of a type"""
-        try:
-            answers = self.resolver.resolve(domain, record_type)
-            return len(answers)
-        except:
-            return 0
-    
-    def extract_has_mx_record(self, domain):
-        """Feature 2: Has MX record"""
-        return 1 if self.extract_dns_record_count(domain, 'MX') > 0 else 0
-    
-    def extract_has_txt_record(self, domain):
-        """Feature 3: Has TXT record (SPF/DKIM)"""
-        return 1 if self.extract_dns_record_count(domain, 'TXT') > 0 else 0
-    
-    def extract_has_ns_record(self, domain):
-        """Feature 4: Has NS record"""
-        return 1 if self.extract_dns_record_count(domain, 'NS') > 0 else 0
-    
-    def extract_nameserver_count(self, domain):
-        """Feature 5: Number of nameservers"""
-        return self.extract_dns_record_count(domain, 'NS')
-    
-    def extract_mx_server_count(self, domain):
-        """Feature 6: Number of mail servers"""
-        return self.extract_dns_record_count(domain, 'MX')
-    
-    def extract_ttl_min(self, domain):
-        """Feature 7: Minimum TTL"""
-        try:
-            answers = self.resolver.resolve(domain, 'A')
-            return min(rdata.ttl for rdata in answers.response.answer) if answers.response.answer else 0
-        except:
-            return 0
-    
-    def extract_ttl_max(self, domain):
-        """Feature 8: Maximum TTL"""
-        try:
-            answers = self.resolver.resolve(domain, 'A')
-            return max(rdata.ttl for rdata in answers.response.answer) if answers.response.answer else 0
-        except:
-            return 0
-    
-    def extract_ttl_avg(self, domain):
-        """Feature 9: Average TTL"""
-        try:
-            answers = self.resolver.resolve(domain, 'A')
-            ttls = [rdata.ttl for rdata in answers.response.answer]
-            return sum(ttls) / len(ttls) if ttls else 0
-        except:
-            return 0
-    
-    def extract_dns_resolution_time(self, domain):
-        """Feature 10: DNS resolution time in ms"""
-        try:
-            start = time.time()
-            self.resolver.resolve(domain, 'A')
-            return (time.time() - start) * 1000
-        except:
-            return 5000  # Timeout value
-    
-    def extract_subdomain_count_dns(self, domain):
-        """Feature 11: Subdomain count from DNS"""
-        try:
-            answers = self.resolver.resolve(domain, 'A')
-            subdomains = set()
-            for rdata in answers:
-                name = str(rdata.name).rstrip('.')
-                if name != domain:
-                    subdomains.add(name)
-            return len(subdomains)
-        except:
-            return 0
-    
-    def extract_has_cname(self, domain):
-        """Feature 12: Has CNAME record"""
-        return self.extract_dns_record_count(domain, 'CNAME')
-    
-    def extract_all_features(self, domain):
-        """Extract all DNS features"""
-        features = {
-            'a_record_count': self.extract_dns_record_count(domain, 'A'),
-            'has_mx_record': self.extract_has_mx_record(domain),
-            'has_txt_record': self.extract_has_txt_record(domain),
-            'has_ns_record': self.extract_has_ns_record(domain),
-            'nameserver_count': self.extract_nameserver_count(domain),
-            'mx_server_count': self.extract_mx_server_count(domain),
-            'ttl_min': self.extract_ttl_min(domain),
-            'ttl_max': self.extract_ttl_max(domain),
-            'ttl_avg': round(self.extract_ttl_avg(domain), 2),
-            'dns_resolution_time': round(self.extract_dns_resolution_time(domain), 2),
-            'subdomain_count_dns': self.extract_subdomain_count_dns(domain),
-            'has_cname': self.extract_has_cname(domain),
-        }
-        
-        # Save DNS records to database
-        self._save_dns_records(domain)
-        
-        return features
-    
-    def _save_dns_records(self, domain):
-        """Save DNS records to database"""
-        record_types = ['A', 'AAAA', 'MX', 'NS', 'TXT', 'CNAME']
-        
-        for record_type in record_types:
+        self._intel = None
+
+    # Lazy loader
+    def _get_intel(self):
+        if self._intel is None:
             try:
-                answers = self.resolver.resolve(domain, record_type)
-                for rdata in answers:
-                    ttl = rdata.ttl if hasattr(rdata, 'ttl') else 0
-                    self.crud.insert_dns_record(
-                        domain=domain,
-                        record_type=record_type,
-                        record_value=str(rdata),
-                        ttl=ttl
-                    )
-            except:
-                pass
+                from src.intelligence.dns_intelligence import DNSIntelligence
+                self._intel = DNSIntelligence()
+            except Exception as e:
+                logger.debug(f"DNSIntelligence unavailable: {e}")
+                self._intel = False
+        return self._intel if self._intel is not False else None
+
+    # ============================================
+    # MAIN
+    # ============================================
+
+    def extract_all_features(self, domain):
+        """Extract all DNS-related features"""
+        defaults = {
+            'dns_a_count': 0,
+            'dns_aaaa_count': 0,
+            'dns_mx_count': 0,
+            'dns_ns_count': 0,
+            'dns_txt_count': 0,
+            'dns_has_a': 0,
+            'dns_has_aaaa': 0,
+            'dns_has_mx': 0,
+            'dns_has_ns': 0,
+            'dns_has_txt': 0,
+            'dns_has_cname': 0,
+            'dns_has_spf': 0,
+            'dns_has_dmarc': 0,
+            'dns_has_dkim': 0,
+            'dns_resolution_time_ms': 0,
+            'dns_lookup_success': 0,
+            'dns_mail_provider_google': 0,
+            'dns_mail_provider_microsoft': 0,
+            'dns_mail_provider_other': 0,
+            'dns_provider_cloudflare': 0,
+            'dns_provider_aws': 0,
+        }
+
+        intel = self._get_intel()
+        if intel is None:
+            return defaults
+
+        try:
+            r = intel.lookup(domain)
+        except Exception as e:
+            logger.debug(f"DNS lookup failed for {domain}: {e}")
+            return defaults
+
+        # Mail provider one-hot
+        mail = (r.get('mail_provider') or '').lower()
+        dns_provider = (r.get('dns_provider') or '').lower()
+
+        return {
+            'dns_a_count': r.get('a_record_count', 0),
+            'dns_aaaa_count': r.get('aaaa_record_count', 0),
+            'dns_mx_count': r.get('mx_count', 0),
+            'dns_ns_count': r.get('ns_count', 0),
+            'dns_txt_count': r.get('txt_count', 0),
+            'dns_has_a': r.get('has_a', 0),
+            'dns_has_aaaa': r.get('has_aaaa', 0),
+            'dns_has_mx': r.get('has_mx', 0),
+            'dns_has_ns': r.get('has_ns', 0),
+            'dns_has_txt': r.get('has_txt', 0),
+            'dns_has_cname': r.get('has_cname', 0),
+            'dns_has_spf': r.get('has_spf', 0),
+            'dns_has_dmarc': r.get('has_dmarc', 0),
+            'dns_has_dkim': r.get('has_dkim', 0),
+            'dns_resolution_time_ms': r.get('resolution_time_ms', 0),
+            'dns_lookup_success': r.get('lookup_success', 0),
+            'dns_mail_provider_google': 1 if 'google' in mail else 0,
+            'dns_mail_provider_microsoft': 1 if 'microsoft' in mail else 0,
+            'dns_mail_provider_other': 1 if mail and 'google' not in mail and 'microsoft' not in mail else 0,
+            'dns_provider_cloudflare': 1 if 'cloudflare' in dns_provider else 0,
+            'dns_provider_aws': 1 if 'aws' in dns_provider or 'route53' in dns_provider else 0,
+        }

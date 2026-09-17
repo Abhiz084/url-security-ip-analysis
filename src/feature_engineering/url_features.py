@@ -1,237 +1,275 @@
 """
-URL Structural Feature Extractor
-Extracts lexical and structural features from URLs
+URL Structural Feature Extractor (Enhanced)
+
+Uses URLNormalizer to safely parse URLs and extract ~40 features
+ready for ML training.
 """
 
-import re
 import math
+import re
 from collections import Counter
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 from loguru import logger
-from database.crud_operations import CRUDOperations
+
+from src.normalization.url_normalizer import URLNormalizer
+
 
 class URLFeatureExtractor:
-    """Extract features from URL structure"""
-    
+    """Extract URL structural features for ML"""
+
     def __init__(self):
-        self.crud = CRUDOperations()
-        
-        # Suspicious patterns
-        self.suspicious_tlds = {'tk', 'ml', 'ga', 'cf', 'gq', 'xyz', 'top', 'work', 'date'}
+        self.normalizer = URLNormalizer()
+
+        # Suspicious TLDs
+        self.suspicious_tlds = {
+            'tk', 'ml', 'ga', 'cf', 'gq', 'xyz', 'top', 'work', 'date',
+            'click', 'icu', 'cfd', 'gdn', 'bond', 'cyou', 'sbs', 'hair',
+            'monster', 'lol', 'pics', 'download', 'review', 'country',
+            'stream', 'loan', 'win', 'racing', 'accountant', 'science',
+            'party', 'webcam', 'bid', 'trade', 'cricket', 'men',
+        }
+
+        # Suspicious keywords
         self.suspicious_keywords = [
-            'login', 'signin', 'verify', 'secure', 'account', 'update', 'confirm',
-            'banking', 'password', 'credential', 'paypal', 'billing', 'support'
+            'login', 'signin', 'verify', 'secure', 'account', 'update',
+            'confirm', 'banking', 'password', 'credential', 'paypal',
+            'billing', 'support', 'alert', 'recovery', 'unlock', 'validate',
         ]
-        self.suspicious_chars = ['@', '-', '_', '=', '&', '%', '#']
-        
-    def extract_url_length(self, url):
-        """Feature 1: URL length"""
-        return len(url)
-    
-    def extract_domain_length(self, domain):
-        """Feature 2: Domain length"""
-        return len(domain)
-    
-    def extract_path_length(self, path):
-        """Feature 3: Path length"""
-        return len(path) if path else 0
-    
-    def extract_subdomain_count(self, domain):
-        """Feature 4: Number of subdomains"""
-        parts = domain.split('.')
-        return max(0, len(parts) - 2)  # Subtract main domain and TLD
-    
-    def extract_dot_count(self, url):
-        """Feature 5: Number of dots in URL"""
-        return url.count('.')
-    
-    def extract_hyphen_count(self, url):
-        """Feature 6: Number of hyphens"""
-        return url.count('-')
-    
-    def extract_underscore_count(self, url):
-        """Feature 7: Number of underscores"""
-        return url.count('_')
-    
-    def extract_slash_count(self, url):
-        """Feature 8: Number of slashes"""
-        return url.count('/')
-    
-    def extract_question_mark_count(self, url):
-        """Feature 9: Number of question marks"""
-        return url.count('?')
-    
-    def extract_equal_count(self, url):
-        """Feature 10: Number of equals signs"""
-        return url.count('=')
-    
-    def extract_at_count(self, url):
-        """Feature 11: Number of @ symbols"""
-        return url.count('@')
-    
-    def extract_digit_count(self, url):
-        """Feature 12: Number of digits"""
-        return sum(c.isdigit() for c in url)
-    
-    def extract_letter_count(self, url):
-        """Feature 13: Number of letters"""
-        return sum(c.isalpha() for c in url)
-    
-    def extract_digit_ratio(self, url):
-        """Feature 14: Ratio of digits to total characters"""
-        total = len(url)
-        if total == 0:
-            return 0
-        return self.extract_digit_count(url) / total
-    
-    def extract_special_char_count(self, url):
-        """Feature 15: Count of special characters"""
-        special_chars = set('!@#$%^&*()_+-=[]{}|;:,.<>?/~`')
-        return sum(1 for c in url if c in special_chars)
-    
-    def extract_entropy(self, text):
-        """Feature 16: Shannon entropy of URL"""
+
+        # Suspicious file extensions
+        self.suspicious_extensions = {
+            '.exe', '.bat', '.cmd', '.msi', '.scr', '.js', '.vbs',
+            '.ps1', '.jar', '.apk', '.dmg', '.deb', '.rpm', '.hta',
+        }
+
+        # Suspicious chars for regex
+        self.special_chars = set('!@#$%^&*()_+-=[]{}|;:,.<>?/~`')
+
+    # ============================================
+    # MAIN ENTRY
+    # ============================================
+    def extract_all_features(self, url, domain=None, path=None, protocol=None, tld=None):
+        """
+        Extract all URL structural features.
+
+        Args:
+            url: Full URL string
+            domain/path/protocol/tld: Optional overrides (legacy support)
+
+        Returns:
+            dict of features
+        """
+        # Normalize first
+        try:
+            norm = self.normalizer.normalize(url)
+            if not norm.is_valid:
+                logger.debug(f"URL normalization failed for: {url[:80]}")
+        except Exception as e:
+            logger.debug(f"Normalizer crashed for {url[:80]}: {e}")
+            norm = None
+
+        # Fallback parsing if normalizer failed
+        if norm is None or not norm.hostname:
+            parsed = urlparse(url)
+            norm = type('obj', (object,), {
+                'normalized_url': url,
+                'decoded_url': url,
+                'scheme': parsed.scheme or 'http',
+                'hostname': domain or parsed.netloc or '',
+                'registered_domain': domain or parsed.netloc or '',
+                'subdomain': '',
+                'tld': tld or (domain.split('.')[-1] if domain and '.' in domain else ''),
+                'port': None,
+                'path': path or parsed.path or '/',
+                'query': parsed.query or '',
+                'query_param_count': 0,
+                'is_ip_host': False,
+                'is_punycode': False,
+                'has_unicode': False,
+                'is_https': parsed.scheme == 'https',
+                'percent_encoding_count': url.count('%'),
+                'has_double_encoding': False,
+                'has_at_symbol': '@' in url,
+                'has_userinfo': False,
+                'is_private_ip': False,
+            })()
+
+        # ============================================
+        # BASIC LENGTH FEATURES
+        # ============================================
+        features = {
+            'url_length': len(url),
+            'normalized_length': len(norm.normalized_url),
+            'decoded_length': len(norm.decoded_url),
+            'hostname_length': len(norm.hostname),
+            'domain_length': len(norm.registered_domain),
+            'subdomain_length': len(norm.subdomain),
+            'path_length': len(norm.path),
+            'query_length': len(norm.query),
+            'fragment_length': len(getattr(norm, 'fragment', '') or ''),
+
+            # ============================================
+            # COUNT FEATURES
+            # ============================================
+            'dot_count': url.count('.'),
+            'hyphen_count': url.count('-'),
+            'underscore_count': url.count('_'),
+            'slash_count': url.count('/'),
+            'question_mark_count': url.count('?'),
+            'equal_count': url.count('='),
+            'ampersand_count': url.count('&'),
+            'at_count': url.count('@'),
+            'colon_count': url.count(':'),
+            'percent_encoding_count': norm.percent_encoding_count,
+            'digit_count': sum(c.isdigit() for c in url),
+            'letter_count': sum(c.isalpha() for c in url),
+            'special_character_count': sum(1 for c in url if c in self.special_chars),
+
+            # ============================================
+            # RATIO FEATURES
+            # ============================================
+            'digit_ratio': round(sum(c.isdigit() for c in url) / max(len(url), 1), 4),
+            'special_ratio': round(
+                sum(1 for c in url if c in self.special_chars) / max(len(url), 1), 4
+            ),
+
+            # ============================================
+            # ENTROPY
+            # ============================================
+            'entropy': round(self._entropy(url), 4),
+            'hostname_entropy': round(self._entropy(norm.hostname), 4),
+            'path_entropy': round(self._entropy(norm.path), 4),
+
+            # ============================================
+            # DOMAIN STRUCTURE
+            # ============================================
+            'subdomain_count': len([p for p in norm.subdomain.split('.') if p]) if norm.subdomain else 0,
+            'domain_token_count': len([p for p in norm.registered_domain.split('.') if p]),
+            'tld_length': len(norm.tld or ''),
+            'longest_token_length': self._longest_token_length(norm.registered_domain),
+
+            # ============================================
+            # SECURITY FLAGS
+            # ============================================
+            'is_https': 1 if norm.is_https else 0,
+            'has_port': 1 if norm.port else 0,
+            'port': norm.port or 0,
+            'non_standard_port': 1 if self._is_nonstandard_port(norm) else 0,
+
+            'is_ip_host': 1 if norm.is_ip_host else 0,
+            'is_private_ip': 1 if getattr(norm, 'is_private_ip', False) else 0,
+            'is_punycode': 1 if norm.is_punycode else 0,
+            'has_unicode': 1 if norm.has_unicode else 0,
+
+            'suspicious_tld': 1 if (norm.tld or '').lower() in self.suspicious_tlds else 0,
+            'suspicious_keywords_count': self._count_keywords(url),
+            'suspicious_file_extension': 1 if self._has_suspicious_extension(norm.path) else 0,
+
+            'has_hex_chars': 1 if self._has_hex(norm.normalized_url) else 0,
+            'has_double_encoding': 1 if norm.has_double_encoding else 0,
+            'has_at_symbol': 1 if norm.has_at_symbol else 0,
+            'has_userinfo': 1 if norm.has_userinfo else 0,
+
+            # ============================================
+            # PATH / QUERY
+            # ============================================
+            'url_depth': self._path_depth(norm.path),
+            'query_param_count': norm.query_param_count,
+            'has_query': 1 if norm.query else 0,
+            'has_fragment': 1 if getattr(norm, 'fragment', '') else 0,
+
+            # ============================================
+            # LEXICAL DIVERSITY
+            # ============================================
+            'unique_char_count': len(set(url)),
+            'unique_char_ratio': round(len(set(url)) / max(len(url), 1), 4),
+        }
+
+        return features
+
+    # ============================================
+    # HELPERS
+    # ============================================
+
+    @staticmethod
+    def _entropy(text):
+        """Shannon entropy of a string"""
         if not text:
-            return 0
-        
-        char_counts = Counter(text)
+            return 0.0
+        counts = Counter(text)
         length = len(text)
-        
-        entropy = 0
-        for count in char_counts.values():
-            probability = count / length
-            entropy -= probability * math.log2(probability)
-        
-        return entropy
-    
-    def extract_suspicious_tld(self, tld):
-        """Feature 17: Suspicious TLD flag"""
-        return 1 if tld.lower() in self.suspicious_tlds else 0
-    
-    def extract_suspicious_keywords_count(self, url):
-        """Feature 18: Count of suspicious keywords"""
-        url_lower = url.lower()
-        return sum(1 for keyword in self.suspicious_keywords if keyword in url_lower)
-    
-    def extract_has_ip_address(self, domain):
-        """Feature 19: Domain contains IP address"""
-        ip_pattern = r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
-        return 1 if re.match(ip_pattern, domain) else 0
-    
-    def extract_has_hex_chars(self, url):
-        """Feature 20: Contains hexadecimal characters"""
-        return 1 if '%' in url and any(c in '0123456789abcdefABCDEF' for c in url) else 0
-    
-    def extract_url_depth(self, path):
-        """Feature 21: URL directory depth"""
+        return -sum(
+            (count / length) * math.log2(count / length)
+            for count in counts.values()
+        )
+
+    @staticmethod
+    def _longest_token_length(domain):
+        if not domain:
+            return 0
+        tokens = re.split(r'[.\-_]', domain)
+        return max((len(t) for t in tokens if t), default=0)
+
+    @staticmethod
+    def _path_depth(path):
         if not path:
             return 0
         return len([p for p in path.split('/') if p])
-    
-    def extract_query_params_count(self, url):
-        """Feature 22: Number of query parameters"""
-        parsed = urlparse(url)
-        if parsed.query:
-            params = parse_qs(parsed.query)
-            return len(params)
-        return 0
-    
-    def extract_is_https(self, protocol):
-        """Feature 23: Uses HTTPS"""
-        return 1 if protocol == 'https' else 0
-    
-    def extract_domain_token_count(self, domain):
-        """Feature 24: Number of tokens in domain"""
-        tokens = re.split(r'[.\-_]', domain)
-        return len([t for t in tokens if t])
-    
-    def extract_longest_token_length(self, domain):
-        """Feature 25: Length of longest token in domain"""
-        tokens = re.split(r'[.\-_]', domain)
-        if not tokens:
-            return 0
-        return max(len(t) for t in tokens if t)
-    
-    def extract_has_suspicious_file_extension(self, url):
-        """Feature 26: Has suspicious file extension"""
-        suspicious_extensions = {'.exe', '.bat', '.cmd', '.msi', '.scr', '.js', '.vbs'}
+
+    def _count_keywords(self, url):
         url_lower = url.lower()
-        return 1 if any(ext in url_lower for ext in suspicious_extensions) else 0
-    
-    def extract_all_features(self, url, domain=None, path=None, protocol=None, tld=None):
-        """Extract all URL features"""
-        if domain is None or path is None:
-            parsed = urlparse(url)
-            domain = domain or parsed.netloc
-            path = path or parsed.path
-            protocol = protocol or parsed.scheme
-            tld = tld or (domain.split('.')[-1] if '.' in domain else '')
-        
-        features = {
-            # Length features
-            'url_length': self.extract_url_length(url),
-            'domain_length': self.extract_domain_length(domain),
-            'path_length': self.extract_path_length(path),
-            
-            # Count features
-            'subdomain_count': self.extract_subdomain_count(domain),
-            'dot_count': self.extract_dot_count(url),
-            'hyphen_count': self.extract_hyphen_count(url),
-            'underscore_count': self.extract_underscore_count(url),
-            'slash_count': self.extract_slash_count(url),
-            'question_mark_count': self.extract_question_mark_count(url),
-            'equal_count': self.extract_equal_count(url),
-            'at_count': self.extract_at_count(url),
-            
-            # Character composition
-            'digit_count': self.extract_digit_count(url),
-            'letter_count': self.extract_letter_count(url),
-            'digit_ratio': self.extract_digit_ratio(url),
-            'special_char_count': self.extract_special_char_count(url),
-            
-            # Advanced features
-            'entropy': round(self.extract_entropy(url), 4),
-            'suspicious_tld': self.extract_suspicious_tld(tld),
-            'suspicious_keywords_count': self.extract_suspicious_keywords_count(url),
-            'has_ip_address': self.extract_has_ip_address(domain),
-            'has_hex_chars': self.extract_has_hex_chars(url),
-            'url_depth': self.extract_url_depth(path),
-            'query_params_count': self.extract_query_params_count(url),
-            'is_https': self.extract_is_https(protocol),
-            'domain_token_count': self.extract_domain_token_count(domain),
-            'longest_token_length': self.extract_longest_token_length(domain),
-            'has_suspicious_file_extension': self.extract_has_suspicious_file_extension(url),
-        }
-        
-        return features
-    
-    def process_urls_batch(self, limit=100):
-        """Process a batch of URLs from database"""
-        urls = self.crud.get_all_urls(limit=limit)
-        
-        processed = 0
-        for url_record in urls:
-            try:
-                features = self.extract_all_features(
-                    url=url_record['full_url'],
-                    domain=url_record['domain'],
-                    path=url_record.get('path', ''),
-                    protocol=url_record.get('protocol', ''),
-                    tld=url_record.get('tld', '')
-                )
-                
-                # Save to feature cache
-                import json
-                self.crud.insert_feature_cache(
-                    url_id=url_record['url_id'],
-                    feature_vector=json.dumps(features),
-                    feature_count=len(features)
-                )
-                
-                processed += 1
-                
-            except Exception as e:
-                logger.error(f"Error processing URL {url_record.get('url_id')}: {e}")
-        
-        logger.info(f"Processed {processed} URLs for features")
-        return processed
+        return sum(1 for kw in self.suspicious_keywords if kw in url_lower)
+
+    def _has_suspicious_extension(self, path):
+        if not path:
+            return False
+        path_lower = path.lower().split('?')[0]
+        return any(path_lower.endswith(ext) for ext in self.suspicious_extensions)
+
+    @staticmethod
+    def _has_hex(url):
+        """Detect hex-encoded sequences like %6C%6F%67"""
+        return 1 if re.search(r'(%[0-9a-fA-F]{2}){3,}', url) else 0
+
+    def _is_nonstandard_port(self, norm):
+        """Return True if URL uses unusual port"""
+        if not norm.port:
+            return False
+        default = {'http': 80, 'https': 443, 'ftp': 21, 'ws': 80, 'wss': 443}
+        return norm.port != default.get(norm.scheme)
+
+
+# ============================================
+# QUICK TEST
+# ============================================
+if __name__ == "__main__":
+    import json
+    extractor = URLFeatureExtractor()
+
+    tests = [
+        "https://www.google.com",
+        "http://suspicious-login.xyz/verify/account.php",
+        "http://192.168.1.1/admin",
+        "https://xn--paypal-9d0b.com/login",
+        "http://trusted.com@evil.com/phishing",
+        "HTTPS://PAYPAL.COM:443/login",
+        "https://example.com/%6C%6F%67%69%6E",
+    ]
+
+    for url in tests:
+        print(f"\n{'='*70}")
+        print(f"URL: {url}")
+        print('='*70)
+        f = extractor.extract_all_features(url)
+        # Print a subset
+        keys_of_interest = [
+            'url_length', 'hostname_length', 'path_length',
+            'subdomain_count', 'dot_count', 'hyphen_count',
+            'digit_count', 'special_character_count', 'percent_encoding_count',
+            'entropy', 'is_https', 'is_ip_host', 'is_punycode', 'has_unicode',
+            'suspicious_tld', 'suspicious_keywords_count', 'has_at_symbol',
+            'has_double_encoding', 'port', 'url_depth',
+        ]
+        for k in keys_of_interest:
+            if k in f:
+                print(f"  {k:<32} = {f[k]}")

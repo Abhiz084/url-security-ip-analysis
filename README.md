@@ -679,6 +679,15 @@ Potential limitations include:
 - Live packet capture requires appropriate permissions and platform-specific configuration.
 
 ---
+### Model Evaluation Methodology
+
+We use **GroupShuffleSplit by domain** to prevent data leakage. This ensures 
+all URLs from a given domain appear in exactly one of the train/test sets, 
+giving a realistic evaluation of generalization to unseen domains.
+
+| Model | Precision | Recall | F1 Score |
+|-------|-----------|--------|----------|
+| ...   | ...       | ...    | ...      |
 
 # 🚀 Future Enhancements
 

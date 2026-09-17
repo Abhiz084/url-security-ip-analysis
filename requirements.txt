@@ -35,3 +35,5 @@ python-dotenv==1.0.0
 pydantic==2.5.0
 loguru==0.7.2
 bcrypt==4.1.1
+shap==0.44.0
+python-Levenshtein==0.25.1
