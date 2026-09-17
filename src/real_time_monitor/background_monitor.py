@@ -1,12 +1,12 @@
 """
 Background Live Monitor
-Runs packet capture in a thread so it can be started/stopped from the dashboard
+Runs packet capture in a thread so it can be started/stopped from the dashboard.
 """
 
 import threading
 import time
+import random
 import re
-import socket
 from datetime import datetime
 from loguru import logger
 from database.crud_operations import CRUDOperations
@@ -20,7 +20,7 @@ except ImportError:
 
 
 class BackgroundLiveMonitor:
-    """Thread-based live traffic monitor that can be controlled from the dashboard"""
+    """Thread-based live traffic monitor controllable from the dashboard"""
 
     def __init__(self):
         self.crud = CRUDOperations()
@@ -28,25 +28,36 @@ class BackgroundLiveMonitor:
         self.stop_event = threading.Event()
         self.is_running = False
         self.use_simulation = False
+        self.lock = threading.Lock()
 
-        # Stats
+        # ---------------- Counters ----------------
         self.total_packets = 0
         self.total_urls = 0
         self.total_alerts = 0
+
+        # ---------------- Tracking buffers ----------------
         self.domains_seen = set()
-        self.recent_domains = []  # last 50 domains for display
+        self.recent_domains = []       # last 50 URLs (dicts)
+        self.recent_packets = []       # last 100 packets
+        self.recent_threats = []       # last 50 threats
 
-        # Thread lock for safe stat updates
-        self.lock = threading.Lock()
+        # Max sizes
+        self.MAX_PACKETS_BUFFER = 100
+        self.MAX_URLS_BUFFER = 50
+        self.MAX_THREATS_BUFFER = 50
 
-        # Suspicious patterns
-        self.suspicious_tlds = ['.tk', '.ml', '.ga', '.cf', '.gq', '.xyz', '.top',
-                                '.work', '.click', '.icu', '.cfd']
-        self.suspicious_keywords = ['login', 'verify', 'paypal', 'banking', 'password',
-                                    'account', 'confirm', 'secure', 'signin']
+        # ---------------- Pattern detection ----------------
+        self.suspicious_tlds = [
+            '.tk', '.ml', '.ga', '.cf', '.gq', '.xyz', '.top',
+            '.work', '.click', '.icu', '.cfd',
+        ]
+        self.suspicious_keywords = [
+            'login', 'verify', 'paypal', 'banking', 'password',
+            'account', 'confirm', 'secure', 'signin',
+        ]
 
     # ============================================
-    # PACKET PARSING
+    # PACKET PARSING (unchanged logic)
     # ============================================
 
     def _extract_http_url(self, packet):
@@ -57,7 +68,7 @@ class BackgroundLiveMonitor:
                 path = http_layer.Path.decode() if http_layer.Path else '/'
                 if host:
                     return f"http://{host}{path}", host
-        except:
+        except Exception:
             pass
         return None, None
 
@@ -67,19 +78,21 @@ class BackgroundLiveMonitor:
                 raw = bytes(packet[Raw].load)
                 if len(raw) > 5 and raw[0] == 0x16 and raw[1] == 0x03:
                     for i in range(len(raw) - 50):
-                        if raw[i:i+2] == b'\x00\x00':
+                        if raw[i:i + 2] == b'\x00\x00':
                             try:
-                                length = int.from_bytes(raw[i+2:i+4], 'big')
-                                sni_data = raw[i+4:i+4+length]
+                                length = int.from_bytes(raw[i + 2:i + 4], 'big')
+                                sni_data = raw[i + 4:i + 4 + length]
                                 if len(sni_data) > 3:
                                     name_len = sni_data[2]
-                                    name = sni_data[3:3+name_len].decode('utf-8', errors='ignore')
+                                    name = sni_data[3:3 + name_len].decode(
+                                        'utf-8', errors='ignore'
+                                    )
                                     if '.' in name and 3 < len(name) < 100:
                                         if all(32 <= ord(c) < 127 for c in name):
                                             return f"https://{name}/", name
-                            except:
+                            except Exception:
                                 pass
-        except:
+        except Exception:
             pass
         return None, None
 
@@ -90,7 +103,7 @@ class BackgroundLiveMonitor:
                     domain = query.qname.decode('utf-8', errors='ignore').rstrip('.')
                     if '.' in domain and len(domain) > 3:
                         return f"dns://{domain}", domain
-        except:
+        except Exception:
             pass
         return None, None
 
@@ -104,12 +117,17 @@ class BackgroundLiveMonitor:
             return True, f"suspicious_keywords:{','.join(matches)}"
         return False, ""
 
-    def _save_url(self, url, domain, src_ip):
-        """Save URL to database and check threats"""
+    # ============================================
+    # SAVE + TRACK
+    # ============================================
+
+    def _save_url(self, url, domain, src_ip, protocol='HTTP'):
+        """Save URL to DB and track it in memory"""
         tld = domain.split('.')[-1] if '.' in domain else ''
         if len(tld) > 20:
             tld = tld[:20]
 
+        # DB write
         try:
             self.crud.insert_url(
                 full_url=url, domain=domain, path='/',
@@ -120,20 +138,43 @@ class BackgroundLiveMonitor:
         except Exception as e:
             logger.debug(f"DB insert skipped: {e}")
 
+        # Memory tracking
+        record = {
+            'url': url,
+            'domain': domain,
+            'src_ip': src_ip,
+            'protocol': protocol,
+            'time': datetime.now().strftime('%H:%M:%S'),
+        }
+        with self.lock:
+            self.recent_domains.append(record)
+            self.recent_domains = self.recent_domains[-self.MAX_URLS_BUFFER:]
+
         # Threat check
         is_threat, reason = self._check_threat(url, domain)
         if is_threat:
+            with self.lock:
+                self.total_alerts += 1
+                self.recent_threats.append({
+                    'url': url,
+                    'domain': domain,
+                    'src_ip': src_ip,
+                    'reason': reason,
+                    'severity': 'high',
+                    'time': datetime.now().strftime('%H:%M:%S'),
+                })
+                self.recent_threats = self.recent_threats[-self.MAX_THREATS_BUFFER:]
+
+            # Persist alert to DB
             try:
                 from src.real_time_monitor.alert_system import AlertSystem
-                alert = AlertSystem()
-                alert.create_alert(
-                    alert_type='suspicious_url', severity='high',
+                AlertSystem().create_alert(
+                    alert_type='suspicious_url',
+                    severity='high',
                     source_ip=src_ip,
                     description=f'Live: {domain} ({reason})'
                 )
-                with self.lock:
-                    self.total_alerts += 1
-            except:
+            except Exception:
                 pass
 
     # ============================================
@@ -145,11 +186,40 @@ class BackgroundLiveMonitor:
             if not IP in packet:
                 return
             src_ip = packet[IP].src
+            dst_ip = packet[IP].dst
+
+            protocol = 'OTHER'
+            src_port = dst_port = 0
+            payload_size = len(packet)
+
+            if TCP in packet:
+                src_port = packet[TCP].sport
+                dst_port = packet[TCP].dport
+                if dst_port in (80, 8080):
+                    protocol = 'HTTP'
+                elif dst_port == 443:
+                    protocol = 'HTTPS'
+                else:
+                    protocol = 'TCP'
+            elif UDP in packet:
+                src_port = packet[UDP].sport
+                dst_port = packet[UDP].dport
+                protocol = 'DNS' if dst_port == 53 else 'UDP'
 
             with self.lock:
                 self.total_packets += 1
+                self.recent_packets.append({
+                    'src_ip': src_ip,
+                    'dst_ip': dst_ip,
+                    'src_port': src_port,
+                    'dst_port': dst_port,
+                    'protocol': protocol,
+                    'size': payload_size,
+                    'time': datetime.now().strftime('%H:%M:%S'),
+                })
+                self.recent_packets = self.recent_packets[-self.MAX_PACKETS_BUFFER:]
 
-            # Extract URL
+            # URL extraction
             url, domain = self._extract_http_url(packet)
             if not url:
                 url, domain = self._extract_https_sni(packet)
@@ -158,69 +228,58 @@ class BackgroundLiveMonitor:
 
             if url and domain and domain not in self.domains_seen:
                 self.domains_seen.add(domain)
-
                 with self.lock:
                     self.total_urls += 1
-                    self.recent_domains.append({
-                        'domain': domain,
-                        'url': url,
-                        'src_ip': src_ip,
-                        'time': datetime.now().strftime('%H:%M:%S')
-                    })
-                    # Keep last 50
-                    self.recent_domains = self.recent_domains[-50:]
-
-                # Save to DB
-                self._save_url(url, domain, src_ip)
+                self._save_url(url, domain, src_ip, protocol)
 
         except Exception as e:
             logger.debug(f"Packet error: {e}")
 
     # ============================================
-    # SIMULATION MODE (Fallback)
+    # SIMULATION MODE
     # ============================================
 
     def _run_simulation(self):
-        """Simulated traffic when real capture is unavailable"""
-        import random
         fake_ips = [
             '192.168.1.100', '10.0.0.50', '45.155.205.233',
-            '185.220.101.34', '8.8.8.8', '1.1.1.1'
+            '185.220.101.34', '8.8.8.8', '1.1.1.1',
         ]
         fake_domains = [
-            ('https://www.google.com/search', 'google.com'),
-            ('https://github.com/trending', 'github.com'),
-            ('https://www.youtube.com/watch', 'youtube.com'),
-            ('https://stackoverflow.com/questions', 'stackoverflow.com'),
-            ('https://www.wikipedia.org/wiki', 'wikipedia.org'),
-            ('http://suspicious-login.xyz/verify', 'suspicious-login.xyz'),
-            ('http://paypal-secure.ml/login', 'paypal-secure.ml'),
-            ('http://free-crypto.work/claim', 'free-crypto.work'),
-            ('https://www.netflix.com/browse', 'netflix.com'),
-            ('https://www.linkedin.com/feed', 'linkedin.com'),
+            ('https://www.google.com/search', 'google.com', 'HTTPS'),
+            ('https://github.com/trending', 'github.com', 'HTTPS'),
+            ('https://www.youtube.com/watch', 'youtube.com', 'HTTPS'),
+            ('https://stackoverflow.com/questions', 'stackoverflow.com', 'HTTPS'),
+            ('https://www.wikipedia.org/wiki', 'wikipedia.org', 'HTTPS'),
+            ('http://suspicious-login.xyz/verify', 'suspicious-login.xyz', 'HTTP'),
+            ('http://paypal-secure.ml/login', 'paypal-secure.ml', 'HTTP'),
+            ('http://free-crypto.work/claim', 'free-crypto.work', 'HTTP'),
+            ('https://www.netflix.com/browse', 'netflix.com', 'HTTPS'),
+            ('https://www.linkedin.com/feed', 'linkedin.com', 'HTTPS'),
         ]
 
-        logger.info("Running in SIMULATION mode")
-
         while not self.stop_event.is_set():
-            url, domain = random.choice(fake_domains)
+            url, domain, proto = random.choice(fake_domains)
             src_ip = random.choice(fake_ips)
+            dst_ip = random.choice(fake_ips)
 
             with self.lock:
                 self.total_packets += 1
+                self.recent_packets.append({
+                    'src_ip': src_ip,
+                    'dst_ip': dst_ip,
+                    'src_port': random.randint(1024, 65535),
+                    'dst_port': 443 if proto == 'HTTPS' else 80,
+                    'protocol': proto,
+                    'size': random.randint(64, 1500),
+                    'time': datetime.now().strftime('%H:%M:%S'),
+                })
+                self.recent_packets = self.recent_packets[-self.MAX_PACKETS_BUFFER:]
 
             if domain not in self.domains_seen:
                 self.domains_seen.add(domain)
                 with self.lock:
                     self.total_urls += 1
-                    self.recent_domains.append({
-                        'domain': domain, 'url': url,
-                        'src_ip': src_ip,
-                        'time': datetime.now().strftime('%H:%M:%S')
-                    })
-                    self.recent_domains = self.recent_domains[-50:]
-
-                self._save_url(url, domain, src_ip)
+                self._save_url(url, domain, src_ip, proto)
 
             time.sleep(random.uniform(1.5, 4.0))
 
@@ -229,7 +288,6 @@ class BackgroundLiveMonitor:
     # ============================================
 
     def _run_capture(self):
-        """Run real packet capture"""
         logger.info("Starting REAL packet capture")
         try:
             sniff(
@@ -254,18 +312,13 @@ class BackgroundLiveMonitor:
     # ============================================
 
     def start(self, force_simulation=False):
-        """Start monitoring in background thread"""
         if self.is_running:
-            logger.info("Monitor already running")
             return False
 
+        # Reset counters for a fresh session
+        self._reset_counters()
         self.stop_event.clear()
         self.is_running = True
-        self.total_packets = 0
-        self.total_urls = 0
-        self.total_alerts = 0
-        self.domains_seen = set()
-        self.recent_domains = []
 
         if force_simulation or not SCAPY_AVAILABLE:
             target = self._run_simulation
@@ -278,7 +331,6 @@ class BackgroundLiveMonitor:
         return True
 
     def stop(self):
-        """Stop monitoring"""
         if not self.is_running:
             return
         self.stop_event.set()
@@ -287,8 +339,31 @@ class BackgroundLiveMonitor:
             self.thread.join(timeout=3)
         logger.info("Background live monitor stopped")
 
+    def reset_stats(self):
+        """
+        Clear all in-memory stats.
+
+        IMPORTANT: Does NOT touch the MySQL database. URLs and alerts
+        already persisted stay in the DB; this only clears the
+        dashboard's live session counters.
+        """
+        self.stop()
+        self._reset_counters()
+        logger.info("In-memory live stats cleared (DB untouched)")
+
+    def _reset_counters(self):
+        with self.lock:
+            self.total_packets = 0
+            self.total_urls = 0
+            self.total_alerts = 0
+            self.domains_seen = set()
+            self.recent_domains = []
+            self.recent_packets = []
+            self.recent_threats = []
+            self.use_simulation = False
+
     def get_stats(self):
-        """Thread-safe stats snapshot"""
+        """Thread-safe snapshot for the dashboard"""
         with self.lock:
             return {
                 'is_running': self.is_running,
@@ -297,15 +372,21 @@ class BackgroundLiveMonitor:
                 'total_urls': self.total_urls,
                 'total_alerts': self.total_alerts,
                 'unique_domains': len(self.domains_seen),
-                'recent_domains': list(self.recent_domains[-20:])
+                'recent_domains': list(self.recent_domains),
+                'recent_packets': list(self.recent_packets),
+                'recent_threats': list(self.recent_threats),
+                'all_domains': sorted(self.domains_seen),
             }
 
 
-# Global singleton
+# ============================================
+# GLOBAL SINGLETON
+# ============================================
+
 _live_monitor_instance = None
 
+
 def get_live_monitor():
-    """Get or create the global live monitor instance"""
     global _live_monitor_instance
     if _live_monitor_instance is None:
         _live_monitor_instance = BackgroundLiveMonitor()
